@@ -21,10 +21,12 @@ import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
@@ -41,6 +43,41 @@ public class RunningServiceImpl implements RunningService {
     private final UserRepository userRepository;
     private final EmblemService emblemService;  // 엠블럼 자동 지급
     private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 업데이트 (재시도 포함)
+    private final RedisTemplate<String, Object> redisTemplate;  // 완료된 러닝 상세 캐시 (write-through)
+
+    private static final String RUNNING_DETAIL_CACHE_KEY_PREFIX = "running:detail:";
+    private static final Duration RUNNING_DETAIL_CACHE_TTL = Duration.ofDays(60);
+
+    /**
+     * 캐시 히트 시 DB를 아예 안 타고 소유자 검증까지 끝내야 하므로, 응답과 함께 소유자 userId를 같이 저장.
+     */
+    private record RunningDetailCacheEntry(Long userId, RunningCompleteResponse response) {}
+
+    /**
+     * 완료된 러닝의 경로 데이터는 이후 절대 수정되지 않으므로(수정 API 없음) 캐시 무효화가 필요 없음.
+     * 실패해도 DB가 source of truth이므로 예외를 삼켜 응답 흐름을 막지 않음.
+     */
+    private void cacheRunningDetail(Long recordId, Long userId, RunningCompleteResponse response) {
+        try {
+            redisTemplate.opsForValue().set(
+                    RUNNING_DETAIL_CACHE_KEY_PREFIX + recordId,
+                    new RunningDetailCacheEntry(userId, response),
+                    RUNNING_DETAIL_CACHE_TTL
+            );
+        } catch (Exception e) {
+            log.warn("러닝 상세 캐시 적재 실패 (DB는 정상 저장됨): recordId={}", recordId, e);
+        }
+    }
+
+    private RunningDetailCacheEntry getCachedRunningDetail(Long recordId) {
+        try {
+            Object cached = redisTemplate.opsForValue().get(RUNNING_DETAIL_CACHE_KEY_PREFIX + recordId);
+            return cached instanceof RunningDetailCacheEntry entry ? entry : null;
+        } catch (Exception e) {
+            log.warn("러닝 상세 캐시 조회 실패, DB로 폴백: recordId={}", recordId, e);
+            return null;
+        }
+    }
 
     @Override
     public RunningStartResponse startRunning(AuthenticatedUser authUser, RunningStartRequest request) {
@@ -195,7 +232,7 @@ public class RunningServiceImpl implements RunningService {
 
         var awardResult = emblemService.scanAndAward(user.getId(), "DISTANCE");
 
-        return RunningCompleteResponse.builder()
+        RunningCompleteResponse response = RunningCompleteResponse.builder()
                 .runningRecordId(savedRecord.getId())
                 .title(savedRecord.getTitle())
                 .totalDistanceKm(savedRecord.getDistance() != null ? savedRecord.getDistance().doubleValue() : 0.0)
@@ -224,6 +261,11 @@ public class RunningServiceImpl implements RunningService {
                 .emblemAwardResult(awardResult)
                 .runningType(savedRecord.getRunningType().name())
                 .build();
+
+        // 완료 시점에 이미 메모리에 있는 응답을 그대로 캐시에 얹음 (추가 DB 조회 없음, D 단계)
+        cacheRunningDetail(savedRecord.getId(), user.getId(), response);
+
+        return response;
     }
 
     @Override
@@ -242,6 +284,14 @@ public class RunningServiceImpl implements RunningService {
     @Override
     @Transactional(readOnly = true)
     public RunningCompleteResponse getDetail(AuthenticatedUser authUser, Long recordId) {
+        RunningDetailCacheEntry cached = getCachedRunningDetail(recordId);
+        if (cached != null) {
+            if (!cached.userId().equals(authUser.getUserId())) {
+                throw new UnauthorizedAccessException("해당 기록에 대한 권한이 없습니다.");
+            }
+            return cached.response();
+        }
+
         RunningRecord r = runningRecordRepository.findWithRoutesById(recordId)
                 .orElseThrow(() -> new RunningRecordNotFoundException(recordId));
 
@@ -249,7 +299,7 @@ public class RunningServiceImpl implements RunningService {
             throw new UnauthorizedAccessException("해당 기록에 대한 권한이 없습니다.");
         }
 
-        return RunningCompleteResponse.builder()
+        RunningCompleteResponse response = RunningCompleteResponse.builder()
                 .runningRecordId(r.getId())
                 .title(r.getTitle())
                 .totalDistanceKm(r.getDistance() != null ? r.getDistance().doubleValue() : 0.0)
@@ -280,6 +330,10 @@ public class RunningServiceImpl implements RunningService {
                 .emblemAwardResult(null)
                 .runningType(r.getRunningType().name())
                 .build();
+
+        cacheRunningDetail(r.getId(), r.getUser().getId(), response);
+
+        return response;
     }
 
     private String formatPace(Integer paceSeconds) {
