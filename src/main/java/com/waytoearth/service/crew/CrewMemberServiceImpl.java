@@ -69,8 +69,11 @@ public class CrewMemberServiceImpl implements CrewMemberService {
             throw new RuntimeException("멤버 추방에 실패했습니다.");
         }
 
-        // 크루 멤버 수 감소
-        crew.decrementMemberCount();
+        // 크루 멤버 수 감소 (원자적 UPDATE — 여러 멤버가 동시에 탈퇴/추방돼도 재시도 없이 안전)
+        int updated = crewRepository.updateCurrentMembersAtomically(crewId, -1);
+        if (updated == 0) {
+            log.warn("크루 멤버 수 갱신 실패(카운터-실제 멤버 수 불일치 가능성) - crewId: {}", crewId);
+        }
 
         log.info("크루 멤버가 추방되었습니다. crewId: {}, targetUserId: {}, removedBy: {}",
                 crewId, targetUserId, user.getUserId());
@@ -96,8 +99,11 @@ public class CrewMemberServiceImpl implements CrewMemberService {
             throw new RuntimeException("크루 탈퇴에 실패했습니다.");
         }
 
-        // 크루 멤버 수 감소
-        crew.decrementMemberCount();
+        // 크루 멤버 수 감소 (원자적 UPDATE — 여러 멤버가 동시에 탈퇴/추방돼도 재시도 없이 안전)
+        int updated = crewRepository.updateCurrentMembersAtomically(crewId, -1);
+        if (updated == 0) {
+            log.warn("크루 멤버 수 갱신 실패(카운터-실제 멤버 수 불일치 가능성) - crewId: {}", crewId);
+        }
 
         log.info("사용자가 크루에서 탈퇴했습니다. crewId: {}, userId: {}", crewId, user.getUserId());
     }

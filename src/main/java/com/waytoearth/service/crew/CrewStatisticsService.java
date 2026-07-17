@@ -76,11 +76,6 @@ public interface CrewStatisticsService {
     Optional<CrewMemberRankingDto> getMvpInCrew(Long crewId, String month);
 
     /**
-     * 동시성 안전한 크루 멤버 수 증가/감소
-     */
-    boolean updateCrewMemberCountSafe(Long crewId, int delta);
-
-    /**
      * 러닝 완료 후 Redis 랭킹 실시간 업데이트 (CrewStatOutboxProcessor에서 호출)
      */
     void updateRedisRankingAfterRun(Long crewId, Long userId, String month);

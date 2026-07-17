@@ -74,12 +74,6 @@ public interface CrewStatisticsRepository extends JpaRepository<CrewStatisticsEn
            "WHERE cs.mvpUser.id = :userId")
     int clearMvpByUserId(@Param("userId") Long userId);
 
-    //크루 현재 멤버 수 원자적 증가/감소
-    @Modifying
-    @Query("UPDATE CrewEntity c SET c.currentMembers = c.currentMembers + :delta " +
-           "WHERE c.id = :crewId AND c.currentMembers + :delta >= 0 AND c.currentMembers + :delta <= c.maxMembers")
-    int updateCurrentMembersAtomically(@Param("crewId") Long crewId, @Param("delta") int delta);
-
     //크루 삭제 시 모든 통계 삭제
     @Modifying
     @Query("DELETE FROM CrewStatisticsEntity cs WHERE cs.crew.id = :crewId")

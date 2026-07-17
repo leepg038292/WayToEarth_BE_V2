@@ -15,7 +15,6 @@ import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
@@ -179,24 +178,6 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
     public void cleanupStatisticsForCrew(Long crewId) {
         statisticsRepository.deleteAllByCrewId(crewId);
         log.info("크루 삭제에 따른 통계 데이터가 물리 삭제되었습니다. crewId: {}", crewId);
-    }
-
-    /**
-     * 동시성 안전한 크루 멤버 수 증가/감소
-     */
-    @Override
-    @Transactional
-    @Retryable(value = {OptimisticLockingFailureException.class}, maxAttempts = 3, backoff = @Backoff(delay = 50))
-    public boolean updateCrewMemberCountSafe(Long crewId, int delta) {
-        int updateCount = statisticsRepository.updateCurrentMembersAtomically(crewId, delta);
-
-        if (updateCount == 0) {
-            log.warn("크루 멤버 수 원자적 업데이트 실패 - crewId: {}, delta: {}", crewId, delta);
-            return false; // 정원 초과나 0 미만이 되려고 했음
-        }
-
-        log.debug("크루 멤버 수 안전 업데이트 완료 - crewId: {}, delta: {}", crewId, delta);
-        return true;
     }
 
     // Private helper methods
