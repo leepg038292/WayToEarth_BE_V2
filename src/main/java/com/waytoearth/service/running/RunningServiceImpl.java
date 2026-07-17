@@ -42,7 +42,7 @@ public class RunningServiceImpl implements RunningService {
     private final RunningRouteRepository runningRouteRepository;
     private final UserRepository userRepository;
     private final EmblemService emblemService;  // 엠블럼 자동 지급
-    private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 업데이트 (재시도 포함)
+    private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 반영 아웃박스 등록
     private final RedisTemplate<String, Object> redisTemplate;  // 완료된 러닝 상세 캐시 (write-through)
 
     private static final String RUNNING_DETAIL_CACHE_KEY_PREFIX = "running:detail:";
@@ -217,16 +217,17 @@ public class RunningServiceImpl implements RunningService {
 
         User user = record.getUser();
 
-        // 크루 통계 업데이트 (크루 랭킹, MVP, Redis 캐시 자동 갱신) - 재시도 로직 포함
+        // 크루 통계 반영은 아웃박스에 등록만 하고 실제 반영은 트랜잭션 밖(AFTER_COMMIT)에서 처리.
+        // 등록(INSERT)만 하는 거라 경합이 없어 핵심 트랜잭션 안에 있어도 안전함.
         try {
-            crewStatisticsUpdater.updateCrewStatisticsIfMember(
+            crewStatisticsUpdater.enqueueCrewStatisticsUpdate(
                     user.getId(),
                     distanceKm.doubleValue(),
                     request.getDurationSeconds()
             );
         } catch (Exception e) {
-            // 재시도 후에도 실패 시 로깅만 하고 러닝 완료는 유지
-            log.error("크루 통계 업데이트 실패 (재시도 완료됨): userId={}, error={}",
+            // 아웃박스 등록 자체가 실패해도 로깅만 하고 러닝 완료는 유지
+            log.error("크루 통계 반영 요청 등록 실패: userId={}, error={}",
                     user.getId(), e.getMessage());
         }
 

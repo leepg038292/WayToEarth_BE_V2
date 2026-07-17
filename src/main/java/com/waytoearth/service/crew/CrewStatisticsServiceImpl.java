@@ -11,8 +11,10 @@ import com.waytoearth.repository.crew.CrewStatisticsRepository;
 import com.waytoearth.repository.crew.CrewMemberRepository;
 import com.waytoearth.repository.user.UserRepository;
 import com.waytoearth.service.ranking.CrewRankingService;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
@@ -35,7 +37,15 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
     private final CrewMemberRepository crewMemberRepository;
     private final UserRepository userRepository;
     private final CrewRankingService crewRankingService;
+    private final EntityManager entityManager;
 
+    /**
+     * "조회해서 없으면 생성"은 동시에 여러 트랜잭션이 같은 크루의 첫 통계 row를 만들려고 하면
+     * 전부 "없다"고 보고 각자 INSERT를 시도하는 경쟁 상태(TOCTOU race)가 생김 — 실측 부하테스트에서
+     * "Query did not return a unique result: 2 results were returned" 예외로 실제 발생 확인됨.
+     * (crew_id, month) 유니크 제약(DB 레벨)으로 중복 저장 자체를 막고, 그 제약 위반이 발생하면
+     * "누군가 나보다 먼저 만들었다"는 뜻이므로 그 row를 다시 조회해서 반환함.
+     */
     @Override
     @Transactional
     public CrewStatisticsEntity getOrCreateMonthlyStatistics(Long crewId, String month) {
@@ -47,7 +57,6 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
             return existing.get();
         }
 
-        // 새로운 월간 통계 생성
         long activeMemberCount = crewMemberRepository.countByCrew(crew);
 
         CrewStatisticsEntity newStats = CrewStatisticsEntity.builder()
@@ -56,11 +65,18 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
                 .activeMembers((int) activeMemberCount)
                 .build();
 
-        CrewStatisticsEntity saved = statisticsRepository.save(newStats);
-
-        log.info("새로운 월간 통계가 생성되었습니다. crewId: {}, month: {}", crewId, month);
-
-        return saved;
+        try {
+            CrewStatisticsEntity saved = statisticsRepository.saveAndFlush(newStats);
+            log.info("새로운 월간 통계가 생성되었습니다. crewId: {}, month: {}", crewId, month);
+            return saved;
+        } catch (DataIntegrityViolationException e) {
+            // 유니크 제약 위반 = 동시에 다른 트랜잭션이 먼저 만듦. 실패한 엔티티를 영속성 컨텍스트에서
+            // 떼어내고, 먼저 만들어진 진짜 row를 다시 조회해서 반환.
+            entityManager.detach(newStats);
+            log.debug("월간 통계 생성 경합 발생, 기존 row 재조회. crewId: {}, month: {}", crewId, month);
+            return statisticsRepository.findByCrewAndMonth(crew, month)
+                    .orElseThrow(() -> e);
+        }
     }
 
     @Override
@@ -83,58 +99,20 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
 
     @Override
     @Transactional
-    public void updateStatisticsAfterRun(Long crewId, Long userId, String month,
-                                       Double distance, Long duration) {
-        CrewStatisticsEntity stats = getOrCreateMonthlyStatistics(crewId, month);
-        User user = getUserEntity(userId);
-
-        // 통계 업데이트
-        // distance를 BigDecimal로 변환
-        BigDecimal distanceBd = BigDecimal.valueOf(distance);
-
-        // duration에서 pace 계산 (초) - division by zero 방지
-        BigDecimal paceSeconds;
-        if (distanceBd.compareTo(BigDecimal.ZERO) <= 0) {
-            log.warn("거리가 0 이하입니다. 통계 업데이트를 건너뜁니다. crewId: {}, userId: {}, distance: {}",
-                    crewId, userId, distance);
-            return;
-        }
-        paceSeconds = BigDecimal.valueOf(duration).divide(distanceBd, 2, BigDecimal.ROUND_HALF_UP);
-
-        stats.updateWithMemberRun(distanceBd, paceSeconds, false);
-
-        log.info("러닝 완료 후 통계가 업데이트되었습니다. crewId: {}, userId: {}, month: {}, distance: {}",
-                crewId, userId, month, distance);
-
-        // MVP 갱신 (비동기적으로 처리할 수도 있음)
-        updateMvpForMonth(crewId, month);
-
-        // Redis 랭킹 실시간 업데이트
-        updateRedisRankingAfterRun(crewId, userId, month);
-    }
-
-    @Override
-    @Transactional
     public void updateMvpForMonth(Long crewId, String month) {
-        CrewEntity crew = getCrewEntity(crewId);
-
         // 현재 MVP 조회
         CrewMemberRankingDto currentMvp = statisticsRepository.findMvpInCrew(crewId, month);
 
         if (currentMvp != null) {
-            // CrewStatisticsEntity의 mvpUserId 업데이트
-            Optional<CrewStatisticsEntity> statsOpt = getMonthlyStatistics(crewId, month);
-            if (statsOpt.isPresent()) {
-                CrewStatisticsEntity stats = statsOpt.get();
-                // MVP 사용자 조회하여 설정
-                User mvpUser = userRepository.findById(currentMvp.getUserId())
-                        .orElseThrow(() -> new RuntimeException("MVP 사용자를 찾을 수 없습니다. userId: " + currentMvp.getUserId()));
-                stats.setMvpUser(mvpUser);
-                stats.setMvpDistance(currentMvp.getTotalDistance());
+            User mvpUser = userRepository.findById(currentMvp.getUserId())
+                    .orElseThrow(() -> new RuntimeException("MVP 사용자를 찾을 수 없습니다. userId: " + currentMvp.getUserId()));
 
-                log.info("월간 MVP가 갱신되었습니다. crewId: {}, month: {}, mvpUserId: {}",
-                        crewId, month, currentMvp.getUserId());
-            }
+            // 원자적 UPDATE — JPA 엔티티를 읽고-mutate-flush 하지 않고 직접 갱신 (동시 처리 중인
+            // 다른 outbox 항목의 통계 UPDATE와 서로 낙관적 락으로 충돌하지 않도록)
+            statisticsRepository.updateMvpUser(crewId, month, mvpUser, currentMvp.getTotalDistance());
+
+            log.info("월간 MVP가 갱신되었습니다. crewId: {}, month: {}, mvpUserId: {}",
+                    crewId, month, currentMvp.getUserId());
         }
     }
 
@@ -204,71 +182,6 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
     }
 
     /**
-     * 동시성 안전한 통계 업데이트 메서드 (Lost Update 방지)
-     * 원자적 SQL 업데이트와 낙관적 잠금을 함께 사용
-     */
-    @Override
-    @Transactional
-    @Retryable(value = {OptimisticLockingFailureException.class}, maxAttempts = 3, backoff = @Backoff(delay = 100))
-    public void updateWithMemberRunSafe(Long crewId, String month, BigDecimal memberDistance,
-                                       BigDecimal memberPaceSeconds, boolean isNewActiveMember) {
-
-        // 1. 먼저 통계 레코드가 있는지 확인하고 생성
-        getOrCreateMonthlyStatistics(crewId, month);
-
-        // 2. 원자적 SQL 업데이트로 기본 통계 업데이트
-        int updateCount = statisticsRepository.updateStatisticsAtomically(
-                crewId, month, 1, memberDistance, isNewActiveMember);
-
-        if (updateCount == 0) {
-            log.warn("통계 원자적 업데이트 실패 - crewId: {}, month: {}", crewId, month);
-            throw new RuntimeException("통계 업데이트에 실패했습니다.");
-        }
-
-        // 3. 평균 페이스 계산은 별도 트랜잭션에서 처리 (복잡한 계산이므로 읽기 후 계산 후 업데이트)
-        updateAveragePaceSafe(crewId, month, memberDistance, memberPaceSeconds);
-
-        log.debug("안전한 통계 업데이트 완료 - crewId: {}, month: {}, distance: {}",
-                  crewId, month, memberDistance);
-    }
-
-    /**
-     * 평균 페이스 안전 업데이트 (복잡한 계산 필요)
-     */
-    private void updateAveragePaceSafe(Long crewId, String month, BigDecimal memberDistance, BigDecimal memberPaceSeconds) {
-        CrewEntity crew = getCrewEntity(crewId);
-        Optional<CrewStatisticsEntity> statsOpt = statisticsRepository.findByCrewAndMonth(crew, month);
-
-        if (statsOpt.isPresent()) {
-            CrewStatisticsEntity stats = statsOpt.get();
-
-            // 새로운 평균 페이스 계산
-            BigDecimal newAvgPace;
-            if (stats.getAvgPaceSeconds() == null) {
-                newAvgPace = memberPaceSeconds;
-            } else {
-                // 거리 기반 가중평균 계산
-                BigDecimal currentTotalDistance = stats.getTotalDistance();
-
-                // division by zero 방지
-                if (currentTotalDistance.compareTo(BigDecimal.ZERO) <= 0) {
-                    newAvgPace = memberPaceSeconds;
-                } else {
-                    BigDecimal previousDistance = currentTotalDistance.subtract(memberDistance);
-
-                    BigDecimal totalWeightedPace = stats.getAvgPaceSeconds().multiply(previousDistance);
-                    BigDecimal newWeightedPace = memberPaceSeconds.multiply(memberDistance);
-                    newAvgPace = totalWeightedPace.add(newWeightedPace)
-                            .divide(currentTotalDistance, 2, BigDecimal.ROUND_HALF_UP);
-                }
-            }
-
-            // 원자적 평균 페이스 업데이트
-            statisticsRepository.updateAveragePace(crewId, month, newAvgPace);
-        }
-    }
-
-    /**
      * 동시성 안전한 크루 멤버 수 증가/감소
      */
     @Override
@@ -308,13 +221,16 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
      * 러닝 완료 후 Redis 랭킹 실시간 업데이트
      * 동시성 문제 해결: DB 조회 대신 Redis ZINCRBY 사용하여 원자적 증가
      * 재시도 로직: Redis 실패 시 최대 3번 재시도
+     * public + 외부(CrewStatOutboxProcessor)에서 호출 — 같은 클래스 내부 호출(self-invocation)이면
+     * @Retryable이 프록시를 못 거쳐 무시되므로, 반드시 다른 빈에서 호출해야 재시도가 실제로 동작함
      */
+    @Override
     @Retryable(
         value = {Exception.class},
         maxAttempts = 3,
         backoff = @Backoff(delay = 200, multiplier = 2)
     )
-    private void updateRedisRankingAfterRun(Long crewId, Long userId, String month) {
+    public void updateRedisRankingAfterRun(Long crewId, Long userId, String month) {
         try {
             // 1. DB에서 최신 거리 조회 (Redis와 동기화)
             BigDecimal userTotalDistance = getUserMonthlyTotalDistance(crewId, userId, month);
@@ -353,10 +269,5 @@ public class CrewStatisticsServiceImpl implements CrewStatisticsService {
     private BigDecimal getCrewMonthlyTotalDistance(Long crewId, String month) {
         CrewStatisticsEntity stats = getMonthlyStatistics(crewId, month).orElse(null);
         return stats != null ? stats.getTotalDistance() : BigDecimal.ZERO;
-    }
-
-    private User getUserEntity(Long userId) {
-        return userRepository.findById(userId)
-                .orElseThrow(() -> new RuntimeException("사용자를 찾을 수 없습니다. userId: " + userId));
     }
 }
