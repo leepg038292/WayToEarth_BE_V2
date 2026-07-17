@@ -8,9 +8,14 @@ import com.waytoearth.dto.response.running.RunningStartResponse;
 import com.waytoearth.entity.enums.RunningStatus;
 import com.waytoearth.entity.enums.RunningType;
 import com.waytoearth.entity.running.RunningRecord;
+import com.waytoearth.entity.running.RunningRoute;
+import com.waytoearth.entity.running.RunningRouteArchive;
 import com.waytoearth.entity.user.User;
+import com.waytoearth.event.RunningRouteArchiveRequestedEvent;
+import com.waytoearth.event.RunningRouteArchiveRequestedEvent.PointSnapshot;
 import com.waytoearth.exception.*;
 import com.waytoearth.repository.running.RunningRecordRepository;
+import com.waytoearth.repository.running.RunningRouteArchiveRepository;
 import com.waytoearth.repository.running.RunningRouteRepository;
 import com.waytoearth.repository.user.UserRepository;
 import com.waytoearth.security.AuthenticatedUser;
@@ -18,6 +23,7 @@ import com.waytoearth.service.emblem.EmblemService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -40,10 +46,12 @@ public class RunningServiceImpl implements RunningService {
 
     private final RunningRecordRepository runningRecordRepository;
     private final RunningRouteRepository runningRouteRepository;
+    private final RunningRouteArchiveRepository runningRouteArchiveRepository;
     private final UserRepository userRepository;
     private final EmblemService emblemService;  // 엠블럼 자동 지급
     private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 반영 아웃박스 등록
     private final RedisTemplate<String, Object> redisTemplate;  // 완료된 러닝 상세 캐시 (write-through)
+    private final ApplicationEventPublisher eventPublisher;  // 러닝 경로 아카이브 복제 등 부가 이벤트 발행
 
     private static final String RUNNING_DETAIL_CACHE_KEY_PREFIX = "running:detail:";
     private static final Duration RUNNING_DETAIL_CACHE_TTL = Duration.ofDays(60);
@@ -266,7 +274,32 @@ public class RunningServiceImpl implements RunningService {
         // 완료 시점에 이미 메모리에 있는 응답을 그대로 캐시에 얹음 (추가 DB 조회 없음, D 단계)
         cacheRunningDetail(savedRecord.getId(), user.getId(), response);
 
+        // 좌표를 running_route_archive에 복제 요청 (AFTER_COMMIT + @Async로 처리, 실패해도 running_route로 폴백됨)
+        eventPublisher.publishEvent(new RunningRouteArchiveRequestedEvent(
+                savedRecord.getId(),
+                toPointSnapshots(savedRecord.getRoutes())
+        ));
+
         return response;
+    }
+
+    private List<PointSnapshot> toPointSnapshots(List<RunningRoute> routes) {
+        LocalDateTime now = LocalDateTime.now(ZoneId.of("Asia/Seoul"));
+        return routes.stream()
+                .map(rt -> new PointSnapshot(
+                        rt.getSequence(),
+                        rt.getLatitude(),
+                        rt.getLongitude(),
+                        rt.getTimestampSeconds(),
+                        rt.getHeartRate(),
+                        rt.getPaceSeconds(),
+                        rt.getAltitude(),
+                        rt.getAccuracy(),
+                        rt.getCumulativeDistanceMeters(),
+                        now,
+                        now
+                ))
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -293,12 +326,14 @@ public class RunningServiceImpl implements RunningService {
             return cached.response();
         }
 
-        RunningRecord r = runningRecordRepository.findWithRoutesById(recordId)
+        RunningRecord r = runningRecordRepository.findById(recordId)
                 .orElseThrow(() -> new RunningRecordNotFoundException(recordId));
 
         if (!r.getUser().getId().equals(authUser.getUserId())) {
             throw new UnauthorizedAccessException("해당 기록에 대한 권한이 없습니다.");
         }
+
+        List<RunningCompleteResponse.RoutePoint> routePoints = resolveRoutePoints(recordId);
 
         RunningCompleteResponse response = RunningCompleteResponse.builder()
                 .runningRecordId(r.getId())
@@ -311,23 +346,8 @@ public class RunningServiceImpl implements RunningService {
                 .maxHeartRate(r.getMaxHeartRate())
                 .startedAt(r.getStartedAt() != null ? r.getStartedAt().toString() : null)
                 .endedAt(r.getEndedAt() != null ? r.getEndedAt().toString() : null)
-                .routePoints(
-                        r.getRoutes().stream()
-                                .map(rt -> RunningCompleteResponse.RoutePoint.builder()
-                                        .latitude(rt.getLatitude())
-                                        .longitude(rt.getLongitude())
-                                        .sequence(rt.getSequence())
-                                        .timestampSeconds(rt.getTimestampSeconds())
-                                        .heartRate(rt.getHeartRate())
-                                        .paceSeconds(rt.getPaceSeconds())
-                                        .altitude(rt.getAltitude())
-                                        .accuracy(rt.getAccuracy())
-                                        .cumulativeDistanceMeters(rt.getCumulativeDistanceMeters())
-                                        .build()
-                                )
-                                .collect(Collectors.toList())
-                )
-                .routePointsCount(r.getRoutes().size())
+                .routePoints(routePoints)
+                .routePointsCount(routePoints.size())
                 .emblemAwardResult(null)
                 .runningType(r.getRunningType().name())
                 .build();
@@ -335,6 +355,45 @@ public class RunningServiceImpl implements RunningService {
         cacheRunningDetail(r.getId(), r.getUser().getId(), response);
 
         return response;
+    }
+
+    /**
+     * running_route_archive(복합키, 조회 빠름)를 먼저 시도하고, 없으면(아카이브 도입 이전 기록이거나
+     * 비동기 복제가 아직/영영 안 된 경우) running_route로 폴백한다.
+     */
+    private List<RunningCompleteResponse.RoutePoint> resolveRoutePoints(Long recordId) {
+        List<RunningRouteArchive> archived =
+                runningRouteArchiveRepository.findById_RunningRecordIdOrderById_SequenceAsc(recordId);
+
+        if (!archived.isEmpty()) {
+            return archived.stream()
+                    .map(a -> RunningCompleteResponse.RoutePoint.builder()
+                            .latitude(a.getLatitude())
+                            .longitude(a.getLongitude())
+                            .sequence(a.getId().getSequence())
+                            .timestampSeconds(a.getTimestampSeconds())
+                            .heartRate(a.getHeartRate())
+                            .paceSeconds(a.getPaceSeconds())
+                            .altitude(a.getAltitude())
+                            .accuracy(a.getAccuracy())
+                            .cumulativeDistanceMeters(a.getCumulativeDistanceMeters())
+                            .build())
+                    .collect(Collectors.toList());
+        }
+
+        return runningRouteRepository.findByRunningRecord_IdOrderBySequenceAsc(recordId).stream()
+                .map(rt -> RunningCompleteResponse.RoutePoint.builder()
+                        .latitude(rt.getLatitude())
+                        .longitude(rt.getLongitude())
+                        .sequence(rt.getSequence())
+                        .timestampSeconds(rt.getTimestampSeconds())
+                        .heartRate(rt.getHeartRate())
+                        .paceSeconds(rt.getPaceSeconds())
+                        .altitude(rt.getAltitude())
+                        .accuracy(rt.getAccuracy())
+                        .cumulativeDistanceMeters(rt.getCumulativeDistanceMeters())
+                        .build())
+                .collect(Collectors.toList());
     }
 
     private String formatPace(Integer paceSeconds) {
