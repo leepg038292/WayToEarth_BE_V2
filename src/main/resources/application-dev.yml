@@ -2,6 +2,10 @@ spring:
   application:
     name: waytoearth-dev
 
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS:false} # 가상 스레드 검증/비교용 - 기본은 꺼짐, env var로 토글
+
   config:
     import: 
       - optional:dotenv:.env
@@ -30,12 +34,19 @@ spring:
         use_sql_comments: true
     open-in-view: false
 
+# 크루 채팅 DB 동시성 백프레셔 (docs/study/04-crew-chat-scalability-redis-pubsub.md §12 참고)
+chat:
+  db-concurrency-limit: ${CHAT_DB_CONCURRENCY_LIMIT:30}
+
 # 개발 서버 설정
 server:
   address: 0.0.0.0
-  port: 8080
+  port: ${SERVER_PORT:8080}
   servlet:
     context-path: /
+  tomcat:
+    mbeanregistry:
+      enabled: true # Tomcat 스레드 풀(tomcat_threads_*) 지표를 Micrometer/Prometheus로 노출하기 위함
 
 # 로깅 설정 (개발환경 - 상세 로그)
 logging:
@@ -71,7 +82,15 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,env
+        include: health,info,metrics,env,prometheus
   endpoint:
     health:
       show-details: always
+  metrics:
+    tags:
+      instance: ${INSTANCE_ID:app-1}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
