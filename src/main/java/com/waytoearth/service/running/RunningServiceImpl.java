@@ -2,6 +2,7 @@ package com.waytoearth.service.running;
 
 import com.waytoearth.dto.request.running.*;
 import com.waytoearth.dto.response.common.CursorPageResponse;
+import com.waytoearth.dto.response.emblem.EmblemAwardResult;
 import com.waytoearth.dto.response.running.RunningCompleteResponse;
 import com.waytoearth.dto.response.running.RunningRecordSummaryResponse;
 import com.waytoearth.dto.response.running.RunningStartResponse;
@@ -189,6 +190,20 @@ public class RunningServiceImpl implements RunningService {
             throw new UnauthorizedAccessException("해당 세션에 대한 권한이 없습니다.");
         }
 
+        // 멱등: 이미 완료된 세션이면 부수효과(통계·크루·경로·엠블럼·아카이브) 없이 첫 완료 결과를 그대로 돌려준다.
+        // 재시도·응답 유실 후 재전송·이중 탭으로 같은 완료가 여러 번 와도 한 번만 반영 (설계 06 §2 E1, 원칙 P3).
+        // 행 잠금(findBySessionIdWithLock)이 동시 요청을 줄 세우므로, 뒤에 온 요청은 앞 요청 커밋 후의 완료 상태를 본다.
+        // 반복 요청의 본문이 달라도 첫 완료 값을 유지한다(sessionId = 멱등 키).
+        if (Boolean.TRUE.equals(record.getIsCompleted())) {
+            log.info("이미 완료된 세션의 완료 요청 — 첫 결과 반환: sessionId={}, recordId={}", request.getSessionId(), record.getId());
+            RunningDetailCacheEntry cached = getCachedRunningDetail(record.getId());
+            if (cached != null && authUser.getUserId().equals(cached.userId())) {
+                return cached.response();   // 첫 응답과 동일(엠블럼 지급 결과 포함)
+            }
+            // 캐시가 없으면 저장된 기록으로 재구성 — 이번 호출에서 새로 지급한 엠블럼은 없음
+            return buildCompleteResponse(record, new EmblemAwardResult(0, List.of()));
+        }
+
         BigDecimal distanceKm = BigDecimal.valueOf(request.getDistanceMeters() / 1000.0);
 
         record.complete(
@@ -241,7 +256,22 @@ public class RunningServiceImpl implements RunningService {
 
         var awardResult = emblemService.scanAndAward(user.getId(), "DISTANCE");
 
-        RunningCompleteResponse response = RunningCompleteResponse.builder()
+        RunningCompleteResponse response = buildCompleteResponse(savedRecord, awardResult);
+
+        // 완료 시점에 이미 메모리에 있는 응답을 그대로 캐시에 얹음 (추가 DB 조회 없음, D 단계)
+        cacheRunningDetail(savedRecord.getId(), user.getId(), response);
+
+        // 좌표를 running_route_archive에 복제 요청 (AFTER_COMMIT + @Async로 처리, 실패해도 running_route로 폴백됨)
+        eventPublisher.publishEvent(new RunningRouteArchiveRequestedEvent(
+                savedRecord.getId(),
+                toPointSnapshots(savedRecord.getRoutes())
+        ));
+
+        return response;
+    }
+
+    private RunningCompleteResponse buildCompleteResponse(RunningRecord savedRecord, EmblemAwardResult awardResult) {
+        return RunningCompleteResponse.builder()
                 .runningRecordId(savedRecord.getId())
                 .title(savedRecord.getTitle())
                 .totalDistanceKm(savedRecord.getDistance() != null ? savedRecord.getDistance().doubleValue() : 0.0)
@@ -270,17 +300,6 @@ public class RunningServiceImpl implements RunningService {
                 .emblemAwardResult(awardResult)
                 .runningType(savedRecord.getRunningType().name())
                 .build();
-
-        // 완료 시점에 이미 메모리에 있는 응답을 그대로 캐시에 얹음 (추가 DB 조회 없음, D 단계)
-        cacheRunningDetail(savedRecord.getId(), user.getId(), response);
-
-        // 좌표를 running_route_archive에 복제 요청 (AFTER_COMMIT + @Async로 처리, 실패해도 running_route로 폴백됨)
-        eventPublisher.publishEvent(new RunningRouteArchiveRequestedEvent(
-                savedRecord.getId(),
-                toPointSnapshots(savedRecord.getRoutes())
-        ));
-
-        return response;
     }
 
     private List<PointSnapshot> toPointSnapshots(List<RunningRoute> routes) {
