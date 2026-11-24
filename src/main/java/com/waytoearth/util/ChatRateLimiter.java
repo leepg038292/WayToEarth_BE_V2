@@ -1,5 +1,7 @@
 package com.waytoearth.util;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -18,6 +20,17 @@ public class ChatRateLimiter {
     // userId -> MessageRate 매핑
     private final Map<Long, MessageRate> userRates = new ConcurrentHashMap<>();
 
+    // 거절 건수 관측용 - 어느 한도(초/분)에 걸렸는지 구분 (docs/study/05-part4-redefinition-toss.md §3 F1/F2)
+    private final Counter rejectedPerSecond;
+    private final Counter rejectedPerMinute;
+
+    public ChatRateLimiter(MeterRegistry meterRegistry) {
+        this.rejectedPerSecond = Counter.builder("chat_rate_limited_total").tag("window", "second")
+                .description("레이트리미터로 거절된 채팅 메시지 수").register(meterRegistry);
+        this.rejectedPerMinute = Counter.builder("chat_rate_limited_total").tag("window", "minute")
+                .description("레이트리미터로 거절된 채팅 메시지 수").register(meterRegistry);
+    }
+
     /**
      * 사용자의 메시지 전송 가능 여부 확인 및 기록 (원자적 연산)
      */
@@ -29,6 +42,12 @@ public class ChatRateLimiter {
             if (rate.canSendMessage()) {
                 rate.recordMessage();
                 return true;
+            }
+            // canSendMessage()와 같은 판정 순서(초 → 분)로 어느 한도인지 기록
+            if (rate.messagesThisSecond >= MAX_MESSAGES_PER_SECOND) {
+                rejectedPerSecond.increment();
+            } else {
+                rejectedPerMinute.increment();
             }
             return false;
         }
