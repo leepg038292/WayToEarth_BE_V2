@@ -2,15 +2,21 @@ package com.waytoearth.service.running;
 
 import com.waytoearth.dto.request.running.*;
 import com.waytoearth.dto.response.common.CursorPageResponse;
+import com.waytoearth.dto.response.emblem.EmblemAwardResult;
 import com.waytoearth.dto.response.running.RunningCompleteResponse;
 import com.waytoearth.dto.response.running.RunningRecordSummaryResponse;
 import com.waytoearth.dto.response.running.RunningStartResponse;
 import com.waytoearth.entity.enums.RunningStatus;
 import com.waytoearth.entity.enums.RunningType;
 import com.waytoearth.entity.running.RunningRecord;
+import com.waytoearth.entity.running.RunningRoute;
+import com.waytoearth.entity.running.RunningRouteArchive;
 import com.waytoearth.entity.user.User;
+import com.waytoearth.event.RunningRouteArchiveRequestedEvent;
+import com.waytoearth.event.RunningRouteArchiveRequestedEvent.PointSnapshot;
 import com.waytoearth.exception.*;
 import com.waytoearth.repository.running.RunningRecordRepository;
+import com.waytoearth.repository.running.RunningRouteArchiveRepository;
 import com.waytoearth.repository.running.RunningRouteRepository;
 import com.waytoearth.repository.user.UserRepository;
 import com.waytoearth.security.AuthenticatedUser;
@@ -18,13 +24,16 @@ import com.waytoearth.service.emblem.EmblemService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
@@ -38,9 +47,46 @@ public class RunningServiceImpl implements RunningService {
 
     private final RunningRecordRepository runningRecordRepository;
     private final RunningRouteRepository runningRouteRepository;
+    private final RunningRouteArchiveRepository runningRouteArchiveRepository;
     private final UserRepository userRepository;
     private final EmblemService emblemService;  // 엠블럼 자동 지급
-    private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 업데이트 (재시도 포함)
+    private final com.waytoearth.service.crew.CrewStatisticsUpdater crewStatisticsUpdater;  // 크루 통계 반영 아웃박스 등록
+    private final RedisTemplate<String, Object> redisTemplate;  // 완료된 러닝 상세 캐시 (write-through)
+    private final ApplicationEventPublisher eventPublisher;  // 러닝 경로 아카이브 복제 등 부가 이벤트 발행
+
+    private static final String RUNNING_DETAIL_CACHE_KEY_PREFIX = "running:detail:";
+    private static final Duration RUNNING_DETAIL_CACHE_TTL = Duration.ofDays(60);
+
+    /**
+     * 캐시 히트 시 DB를 아예 안 타고 소유자 검증까지 끝내야 하므로, 응답과 함께 소유자 userId를 같이 저장.
+     */
+    private record RunningDetailCacheEntry(Long userId, RunningCompleteResponse response) {}
+
+    /**
+     * 완료된 러닝의 경로 데이터는 이후 절대 수정되지 않으므로(수정 API 없음) 캐시 무효화가 필요 없음.
+     * 실패해도 DB가 source of truth이므로 예외를 삼켜 응답 흐름을 막지 않음.
+     */
+    private void cacheRunningDetail(Long recordId, Long userId, RunningCompleteResponse response) {
+        try {
+            redisTemplate.opsForValue().set(
+                    RUNNING_DETAIL_CACHE_KEY_PREFIX + recordId,
+                    new RunningDetailCacheEntry(userId, response),
+                    RUNNING_DETAIL_CACHE_TTL
+            );
+        } catch (Exception e) {
+            log.warn("러닝 상세 캐시 적재 실패 (DB는 정상 저장됨): recordId={}", recordId, e);
+        }
+    }
+
+    private RunningDetailCacheEntry getCachedRunningDetail(Long recordId) {
+        try {
+            Object cached = redisTemplate.opsForValue().get(RUNNING_DETAIL_CACHE_KEY_PREFIX + recordId);
+            return cached instanceof RunningDetailCacheEntry entry ? entry : null;
+        } catch (Exception e) {
+            log.warn("러닝 상세 캐시 조회 실패, DB로 폴백: recordId={}", recordId, e);
+            return null;
+        }
+    }
 
     @Override
     public RunningStartResponse startRunning(AuthenticatedUser authUser, RunningStartRequest request) {
@@ -144,6 +190,20 @@ public class RunningServiceImpl implements RunningService {
             throw new UnauthorizedAccessException("해당 세션에 대한 권한이 없습니다.");
         }
 
+        // 멱등: 이미 완료된 세션이면 부수효과(통계·크루·경로·엠블럼·아카이브) 없이 첫 완료 결과를 그대로 돌려준다.
+        // 재시도·응답 유실 후 재전송·이중 탭으로 같은 완료가 여러 번 와도 한 번만 반영 (설계 06 §2 E1, 원칙 P3).
+        // 행 잠금(findBySessionIdWithLock)이 동시 요청을 줄 세우므로, 뒤에 온 요청은 앞 요청 커밋 후의 완료 상태를 본다.
+        // 반복 요청의 본문이 달라도 첫 완료 값을 유지한다(sessionId = 멱등 키).
+        if (Boolean.TRUE.equals(record.getIsCompleted())) {
+            log.info("이미 완료된 세션의 완료 요청 — 첫 결과 반환: sessionId={}, recordId={}", request.getSessionId(), record.getId());
+            RunningDetailCacheEntry cached = getCachedRunningDetail(record.getId());
+            if (cached != null && authUser.getUserId().equals(cached.userId())) {
+                return cached.response();   // 첫 응답과 동일(엠블럼 지급 결과 포함)
+            }
+            // 캐시가 없으면 저장된 기록으로 재구성 — 이번 호출에서 새로 지급한 엠블럼은 없음
+            return buildCompleteResponse(record, new EmblemAwardResult(0, List.of()));
+        }
+
         BigDecimal distanceKm = BigDecimal.valueOf(request.getDistanceMeters() / 1000.0);
 
         record.complete(
@@ -180,21 +240,37 @@ public class RunningServiceImpl implements RunningService {
 
         User user = record.getUser();
 
-        // 크루 통계 업데이트 (크루 랭킹, MVP, Redis 캐시 자동 갱신) - 재시도 로직 포함
+        // 크루 통계 반영은 아웃박스에 등록만 하고 실제 반영은 트랜잭션 밖(AFTER_COMMIT)에서 처리.
+        // 등록(INSERT)만 하는 거라 경합이 없어 핵심 트랜잭션 안에 있어도 안전함.
         try {
-            crewStatisticsUpdater.updateCrewStatisticsIfMember(
+            crewStatisticsUpdater.enqueueCrewStatisticsUpdate(
                     user.getId(),
                     distanceKm.doubleValue(),
                     request.getDurationSeconds()
             );
         } catch (Exception e) {
-            // 재시도 후에도 실패 시 로깅만 하고 러닝 완료는 유지
-            log.error("크루 통계 업데이트 실패 (재시도 완료됨): userId={}, error={}",
+            // 아웃박스 등록 자체가 실패해도 로깅만 하고 러닝 완료는 유지
+            log.error("크루 통계 반영 요청 등록 실패: userId={}, error={}",
                     user.getId(), e.getMessage());
         }
 
         var awardResult = emblemService.scanAndAward(user.getId(), "DISTANCE");
 
+        RunningCompleteResponse response = buildCompleteResponse(savedRecord, awardResult);
+
+        // 완료 시점에 이미 메모리에 있는 응답을 그대로 캐시에 얹음 (추가 DB 조회 없음, D 단계)
+        cacheRunningDetail(savedRecord.getId(), user.getId(), response);
+
+        // 좌표를 running_route_archive에 복제 요청 (AFTER_COMMIT + @Async로 처리, 실패해도 running_route로 폴백됨)
+        eventPublisher.publishEvent(new RunningRouteArchiveRequestedEvent(
+                savedRecord.getId(),
+                toPointSnapshots(savedRecord.getRoutes())
+        ));
+
+        return response;
+    }
+
+    private RunningCompleteResponse buildCompleteResponse(RunningRecord savedRecord, EmblemAwardResult awardResult) {
         return RunningCompleteResponse.builder()
                 .runningRecordId(savedRecord.getId())
                 .title(savedRecord.getTitle())
@@ -226,6 +302,25 @@ public class RunningServiceImpl implements RunningService {
                 .build();
     }
 
+    private List<PointSnapshot> toPointSnapshots(List<RunningRoute> routes) {
+        LocalDateTime now = LocalDateTime.now(ZoneId.of("Asia/Seoul"));
+        return routes.stream()
+                .map(rt -> new PointSnapshot(
+                        rt.getSequence(),
+                        rt.getLatitude(),
+                        rt.getLongitude(),
+                        rt.getTimestampSeconds(),
+                        rt.getHeartRate(),
+                        rt.getPaceSeconds(),
+                        rt.getAltitude(),
+                        rt.getAccuracy(),
+                        rt.getCumulativeDistanceMeters(),
+                        now,
+                        now
+                ))
+                .collect(Collectors.toList());
+    }
+
     @Override
     public void updateTitle(AuthenticatedUser authUser, Long recordId, RunningTitleUpdateRequest request) {
         RunningRecord record = runningRecordRepository.findById(recordId)
@@ -242,14 +337,24 @@ public class RunningServiceImpl implements RunningService {
     @Override
     @Transactional(readOnly = true)
     public RunningCompleteResponse getDetail(AuthenticatedUser authUser, Long recordId) {
-        RunningRecord r = runningRecordRepository.findWithRoutesById(recordId)
+        RunningDetailCacheEntry cached = getCachedRunningDetail(recordId);
+        if (cached != null) {
+            if (!cached.userId().equals(authUser.getUserId())) {
+                throw new UnauthorizedAccessException("해당 기록에 대한 권한이 없습니다.");
+            }
+            return cached.response();
+        }
+
+        RunningRecord r = runningRecordRepository.findById(recordId)
                 .orElseThrow(() -> new RunningRecordNotFoundException(recordId));
 
         if (!r.getUser().getId().equals(authUser.getUserId())) {
             throw new UnauthorizedAccessException("해당 기록에 대한 권한이 없습니다.");
         }
 
-        return RunningCompleteResponse.builder()
+        List<RunningCompleteResponse.RoutePoint> routePoints = resolveRoutePoints(recordId);
+
+        RunningCompleteResponse response = RunningCompleteResponse.builder()
                 .runningRecordId(r.getId())
                 .title(r.getTitle())
                 .totalDistanceKm(r.getDistance() != null ? r.getDistance().doubleValue() : 0.0)
@@ -260,26 +365,54 @@ public class RunningServiceImpl implements RunningService {
                 .maxHeartRate(r.getMaxHeartRate())
                 .startedAt(r.getStartedAt() != null ? r.getStartedAt().toString() : null)
                 .endedAt(r.getEndedAt() != null ? r.getEndedAt().toString() : null)
-                .routePoints(
-                        r.getRoutes().stream()
-                                .map(rt -> RunningCompleteResponse.RoutePoint.builder()
-                                        .latitude(rt.getLatitude())
-                                        .longitude(rt.getLongitude())
-                                        .sequence(rt.getSequence())
-                                        .timestampSeconds(rt.getTimestampSeconds())
-                                        .heartRate(rt.getHeartRate())
-                                        .paceSeconds(rt.getPaceSeconds())
-                                        .altitude(rt.getAltitude())
-                                        .accuracy(rt.getAccuracy())
-                                        .cumulativeDistanceMeters(rt.getCumulativeDistanceMeters())
-                                        .build()
-                                )
-                                .collect(Collectors.toList())
-                )
-                .routePointsCount(r.getRoutes().size())
+                .routePoints(routePoints)
+                .routePointsCount(routePoints.size())
                 .emblemAwardResult(null)
                 .runningType(r.getRunningType().name())
                 .build();
+
+        cacheRunningDetail(r.getId(), r.getUser().getId(), response);
+
+        return response;
+    }
+
+    /**
+     * running_route_archive(복합키, 조회 빠름)를 먼저 시도하고, 없으면(아카이브 도입 이전 기록이거나
+     * 비동기 복제가 아직/영영 안 된 경우) running_route로 폴백한다.
+     */
+    private List<RunningCompleteResponse.RoutePoint> resolveRoutePoints(Long recordId) {
+        List<RunningRouteArchive> archived =
+                runningRouteArchiveRepository.findById_RunningRecordIdOrderById_SequenceAsc(recordId);
+
+        if (!archived.isEmpty()) {
+            return archived.stream()
+                    .map(a -> RunningCompleteResponse.RoutePoint.builder()
+                            .latitude(a.getLatitude())
+                            .longitude(a.getLongitude())
+                            .sequence(a.getId().getSequence())
+                            .timestampSeconds(a.getTimestampSeconds())
+                            .heartRate(a.getHeartRate())
+                            .paceSeconds(a.getPaceSeconds())
+                            .altitude(a.getAltitude())
+                            .accuracy(a.getAccuracy())
+                            .cumulativeDistanceMeters(a.getCumulativeDistanceMeters())
+                            .build())
+                    .collect(Collectors.toList());
+        }
+
+        return runningRouteRepository.findByRunningRecord_IdOrderBySequenceAsc(recordId).stream()
+                .map(rt -> RunningCompleteResponse.RoutePoint.builder()
+                        .latitude(rt.getLatitude())
+                        .longitude(rt.getLongitude())
+                        .sequence(rt.getSequence())
+                        .timestampSeconds(rt.getTimestampSeconds())
+                        .heartRate(rt.getHeartRate())
+                        .paceSeconds(rt.getPaceSeconds())
+                        .altitude(rt.getAltitude())
+                        .accuracy(rt.getAccuracy())
+                        .cumulativeDistanceMeters(rt.getCumulativeDistanceMeters())
+                        .build())
+                .collect(Collectors.toList());
     }
 
     private String formatPace(Integer paceSeconds) {

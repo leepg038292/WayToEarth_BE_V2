@@ -5,7 +5,6 @@ import com.waytoearth.dto.response.crew.CrewMemberRankingDto;
 import com.waytoearth.dto.response.crew.CrewRankingDto;
 import com.waytoearth.entity.crew.CrewStatisticsEntity;
 
-import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 
@@ -30,12 +29,6 @@ public interface CrewStatisticsService {
      * 크루의 기간별 통계 목록
      */
     List<CrewStatisticsEntity> getCrewStatisticsByPeriod(Long crewId, String startMonth, String endMonth);
-
-    /**
-     * 러닝 완료 시 통계 업데이트
-     */
-    void updateStatisticsAfterRun(Long crewId, Long userId, String month,
-                                 Double distance, Long duration);
 
     /**
      * 월간 MVP 갱신
@@ -83,13 +76,7 @@ public interface CrewStatisticsService {
     Optional<CrewMemberRankingDto> getMvpInCrew(Long crewId, String month);
 
     /**
-     * 동시성 안전한 통계 업데이트 (Lost Update 방지)
+     * 러닝 완료 후 Redis 랭킹 실시간 업데이트 (CrewStatOutboxProcessor에서 호출)
      */
-    void updateWithMemberRunSafe(Long crewId, String month, BigDecimal memberDistance,
-                                BigDecimal memberPaceSeconds, boolean isNewActiveMember);
-
-    /**
-     * 동시성 안전한 크루 멤버 수 증가/감소
-     */
-    boolean updateCrewMemberCountSafe(Long crewId, int delta);
+    void updateRedisRankingAfterRun(Long crewId, Long userId, String month);
 }

@@ -9,7 +9,8 @@ import lombok.*;
 import java.math.BigDecimal;
 
 @Entity
-@Table(name = "crew_statistics")
+@Table(name = "crew_statistics",
+        uniqueConstraints = @UniqueConstraint(name = "uk_crew_statistics_crew_month", columnNames = {"crew_id", "month"}))
 @Getter
 @Setter
 @NoArgsConstructor
@@ -81,38 +82,6 @@ public class CrewStatisticsEntity extends BaseTimeEntity {
                 .totalDistance(BigDecimal.ZERO)
                 .activeMembers(0)
                 .build();
-    }
-
-    /**
-     * 크루 멤버의 러닝 기록으로 통계 업데이트
-     * @param memberDistance 멤버가 뛴 거리
-     * @param memberPaceSeconds 멤버의 페이스
-     * @param isNewActiveMember 이번 달 처음 뛰는 멤버인지 여부
-     */
-    public void updateWithMemberRun(BigDecimal memberDistance, BigDecimal memberPaceSeconds, boolean isNewActiveMember) {
-        this.runCount++;
-        this.totalDistance = this.totalDistance.add(memberDistance);
-
-        // 평균 페이스 재계산 (전체 러닝 기록의 가중평균)
-        if (this.avgPaceSeconds == null) {
-            this.avgPaceSeconds = memberPaceSeconds;
-        } else {
-            // division by zero 방지
-            if (this.totalDistance.compareTo(BigDecimal.ZERO) <= 0) {
-                this.avgPaceSeconds = memberPaceSeconds;
-            } else {
-                // 거리 기반 가중평균으로 계산
-                BigDecimal totalWeightedPace = this.avgPaceSeconds.multiply(this.totalDistance.subtract(memberDistance));
-                BigDecimal newWeightedPace = memberPaceSeconds.multiply(memberDistance);
-                this.avgPaceSeconds = totalWeightedPace.add(newWeightedPace)
-                        .divide(this.totalDistance, 2, BigDecimal.ROUND_HALF_UP);
-            }
-        }
-
-        // 새로운 활성 멤버인 경우 카운트 증가
-        if (isNewActiveMember) {
-            this.activeMembers++;
-        }
     }
 
     /**

@@ -140,12 +140,17 @@ public class JourneyServiceImpl implements JourneyService {
     }
 
     private JourneyProgressResponse updateProgressInternal(UserJourneyProgressEntity progress, JourneyProgressUpdateRequest request) {
+        // E2: 같은 세션 재전송이면 부수효과 없이 현재 상태 반환 (완료 체크보다 먼저 — 이 세션으로 100% 달성한 경우 재전송도 200)
+        if (progress.isAlreadyApplied(request.sessionId())) {
+            log.info("여행 진행 재전송 무시: progressId={}, sessionId={}", progress.getId(), request.sessionId());
+            return buildProgressResponse(progress);
+        }
         if (progress.getStatus() == JourneyProgressStatus.COMPLETED) {
             throw new IllegalArgumentException("이미 완료된 여행입니다.");
         }
 
         // 진행률 업데이트
-        progress.updateProgress(request.distanceKm());
+        progress.applySessionProgress(request.sessionId(), request.distanceKm());
         progress.setSessionId(request.sessionId());
 
         // 러닝 레코드 완료 처리

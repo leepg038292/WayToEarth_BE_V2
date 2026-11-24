@@ -335,7 +335,7 @@ public class UserService {
         var affectedCrewIds = memberships.stream().map(m -> m.getCrew().getId()).distinct().toList();
         crewMemberRepository.deleteByUserId(userId);
         for (Long crewId : affectedCrewIds) {
-            crewStatisticsRepository.updateCurrentMembersAtomically(crewId, -1);
+            crewRepository.updateCurrentMembersAtomically(crewId, -1);
         }
         log.debug("[UserService] 크루 멤버십 삭제 완료");
 

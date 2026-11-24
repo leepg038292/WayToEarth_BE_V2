@@ -63,6 +63,10 @@ public class UserJourneyProgressEntity extends BaseTimeEntity {
     @Schema(description = "현재 러닝 세션 ID", example = "session-uuid-123")
     private String sessionId;
 
+    @Schema(description = "진행 거리를 마지막으로 반영한 러닝 세션 ID (재전송 이중 가산 방지, E2)", hidden = true)
+    @Column(name = "last_applied_session_id")
+    private String lastAppliedSessionId;
+
     @OneToMany(mappedBy = "userJourneyProgress", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     @Builder.Default
     private List<StampEntity> collectedStamps = new ArrayList<>();
@@ -78,6 +82,16 @@ public class UserJourneyProgressEntity extends BaseTimeEntity {
         if (startedAt == null) {
             startedAt = LocalDateTime.now(ZoneId.of("Asia/Seoul"));
         }
+    }
+
+    /** 같은 세션의 진행 요청이 이미 반영됐는가 — 응답 유실 후 재전송이면 true (E2) */
+    public boolean isAlreadyApplied(String sessionId) {
+        return sessionId != null && sessionId.equals(this.lastAppliedSessionId);
+    }
+
+    public void applySessionProgress(String sessionId, Double distanceKm) {
+        updateProgress(distanceKm);
+        this.lastAppliedSessionId = sessionId;
     }
 
     public void updateProgress(Double distanceKm) {
