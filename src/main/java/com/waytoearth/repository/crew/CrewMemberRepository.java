@@ -49,6 +49,11 @@ public interface CrewMemberRepository extends JpaRepository<CrewMemberEntity, Lo
            "WHERE cm.crew.id = :crewId AND cm.user.id = :userId")
     boolean isUserMemberOfCrew(@Param("userId") Long userId, @Param("crewId") Long crewId);
 
+    // 결정 D-2(F9): 브로드캐스트 1회당 멤버 ID를 한 번에 조회 - 수신자마다 isUserMemberOfCrew를 부르던 N회 조회를 1회로.
+    // 조건은 isUserMemberOfCrew와 동일(crew_id 일치)해서 권한 확인의 의미는 그대로다.
+    @Query("SELECT cm.user.id FROM CrewMemberEntity cm WHERE cm.crew.id = :crewId")
+    java.util.List<Long> findMemberUserIds(@Param("crewId") Long crewId);
+
     //크루장 확인
     @Query("SELECT CASE WHEN COUNT(cm) > 0 THEN true ELSE false END " +
            "FROM CrewMemberEntity cm " +

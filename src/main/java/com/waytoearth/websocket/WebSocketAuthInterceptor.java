@@ -1,6 +1,8 @@
 package com.waytoearth.websocket;
 
+import com.waytoearth.entity.user.User;
 import com.waytoearth.repository.crew.CrewMemberRepository;
+import com.waytoearth.repository.user.UserRepository;
 import com.waytoearth.service.auth.JwtTokenProvider;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,8 +19,13 @@ import java.util.Map;
 @Slf4j
 public class WebSocketAuthInterceptor implements HandshakeInterceptor {
 
+    private static final String UNKNOWN_NICKNAME = "Unknown";
+
     private final JwtTokenProvider jwtTokenProvider;
     private final CrewMemberRepository crewMemberRepository;
+    private final UserRepository userRepository;
+    private final ChatDbConcurrencyLimiter concurrencyLimiter;
+    private final ChatObservability obs;
 
     @Override
     public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
@@ -42,16 +49,41 @@ public class WebSocketAuthInterceptor implements HandshakeInterceptor {
                 return false;
             }
 
-            // 크루 멤버인지 확인
-            if (!crewMemberRepository.isUserMemberOfCrew(userId, crewId)) {
-                log.warn("WebSocket 연결 거부 - 크루 멤버 아님: userId={}, crewId={}", userId, crewId);
+            // 여기서부터 DB를 건드리는 구간(멤버십 확인 + 닉네임 조회) - 백프레셔로 동시
+            // 실행 개수를 제한. 허가를 못 받으면 큐에 쌓지 않고 즉시 핸드셰이크를 거절한다
+            // (docs/study/04-crew-chat-scalability-redis-pubsub.md §12 참고)
+            if (!concurrencyLimiter.tryAcquire()) {
+                obs.count("chat_handshake_total", "result", "rejected_semaphore");
+                log.warn("WebSocket 연결 거부 - DB 동시성 한도 초과: userId={}, crewId={}", userId, crewId);
                 return false;
+            }
+
+            String nickname;
+            try {
+                // 크루 멤버인지 확인
+                obs.count("chat_membership_query_total", "site", "handshake");
+                if (!crewMemberRepository.isUserMemberOfCrew(userId, crewId)) {
+                    obs.count("chat_handshake_total", "result", "rejected_not_member");
+                    log.warn("WebSocket 연결 거부 - 크루 멤버 아님: userId={}, crewId={}", userId, crewId);
+                    return false;
+                }
+
+                // 닉네임을 핸드셰이크 시점에 한 번만 조회해 세션에 캐싱 - 입장/메시지/퇴장마다
+                // 매번 DB를 다시 때리지 않기 위함 (메시지 전송 시점에 반복 조회하던 게 실측으로
+                // 확인된 병목이었음)
+                obs.count("chat_user_query_total", "site", "handshake_nickname");
+                User user = userRepository.findById(userId).orElse(null);
+                nickname = user != null ? user.getNickname() : UNKNOWN_NICKNAME;
+            } finally {
+                concurrencyLimiter.release();
             }
 
             attributes.put("userId", userId);
             attributes.put("crewId", crewId);
             attributes.put("token", token);
+            attributes.put("nickname", nickname);
 
+            obs.count("chat_handshake_total", "result", "accepted");
             log.info("WebSocket 인증 성공 - userId: {}, crewId: {}", userId, crewId);
             return true;
 

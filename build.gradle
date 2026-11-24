@@ -82,9 +82,9 @@ dependencies {
 	annotationProcessor 'org.projectlombok:lombok'
 
 	// JWT
-	implementation 'io.jsonwebtoken:jjwt-api:0.12.3'
-	runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.3'
-	runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.3'
+	implementation 'io.jsonwebtoken:jjwt-api:0.12.4'
+	runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.4'
+	runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.4'
 
 	// Swagger / OpenAPI
 	implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.8.9'
@@ -119,6 +119,9 @@ dependencies {
 
 	// Actuator (헬스체크용 - ALB/배포 환경에서 필요)
 	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+	// Micrometer -> Prometheus (크루 채팅 확장성 부하테스트 지표 수집용)
+	implementation 'io.micrometer:micrometer-registry-prometheus'
 
 	// .env 로더
 	implementation 'me.paulschwarz:spring-dotenv:3.0.0'
